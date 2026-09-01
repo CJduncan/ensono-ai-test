@@ -1,0 +1,89 @@
+name: Promote a project
+
+# Owner-initiated, on demand. Nothing is promoted automatically — a project can
+# live on `develop` (development) forever. When an owner decides their project is
+# ready for the next stage, they run this. It moves ONLY that project's folder up
+# and hands back a PR link for them to open, so:
+#   * experiments never ride along to testing/production,
+#   * a human opens the PR (so CI actually runs on it),
+#   * every promotion is still a reviewed, gated PR.
+#
+# Stages: develop (development) -> testing -> main (production).
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Project slug (the folder name under projects/)"
+        required: true
+      target:
+        description: "Promote to which stage?"
+        required: true
+        type: choice
+        options: [testing, production]
+
+permissions:
+  contents: write   # push the promotion branch; the human opens the PR
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare promotion branch
+        run: |
+          set -euo pipefail
+          slug='${{ github.event.inputs.project }}'
+          case '${{ github.event.inputs.target }}' in
+            testing)    source=develop; base=testing ;;
+            production) source=testing; base=main ;;
+            *) echo "::error::Unknown target"; exit 1 ;;
+          esac
+
+          git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+
+          # The project must already exist (and have passed CI) on the source stage.
+          if ! git cat-file -e "origin/$source:projects/$slug/README.md" 2>/dev/null; then
+            echo "::error title=Not on $source::projects/$slug is not on '$source' yet. Land it there first."
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/remotes/origin/$base"; then
+            echo "::error title=Missing stage::The '$base' branch does not exist yet. Create it before promoting."
+            exit 1
+          fi
+
+          branch="promote/$slug-to-$base"
+          git checkout -B "$branch" "origin/$base"
+
+          # Bring ONLY this project's folder up from the source stage.
+          rm -rf "projects/$slug"
+          git checkout "origin/$source" -- "projects/$slug"
+
+          # Carry the project's CODEOWNERS line so review still routes to its owner.
+          owner_line=$(git show "origin/$source:.github/CODEOWNERS" | grep -E "^/projects/$slug/ " || true)
+          if [ -n "$owner_line" ] && ! grep -qF "$owner_line" .github/CODEOWNERS; then
+            echo "$owner_line" >> .github/CODEOWNERS
+          fi
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "::notice title=Nothing to promote::'$slug' on '$base' already matches '$source'."
+            exit 0
+          fi
+
+          git config user.name "project-promoter[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Promote $slug: $source -> $base"
+          git push -f -u origin "$branch"
+
+          url="${{ github.server_url }}/${{ github.repository }}/compare/$base...$branch?expand=1"
+          echo "::notice title=Ready to promote::Open this PR to promote $slug into $base"
+          {
+            echo "### :rocket: $slug is ready to promote to \`$base\`"
+            echo ""
+            echo "Only this project's folder moves. Open the PR, let CI run, get it reviewed, merge:"
+            echo ""
+            echo "**[Open the promotion PR]($url)**"
+          } >> "$GITHUB_STEP_SUMMARY"

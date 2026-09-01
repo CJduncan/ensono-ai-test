@@ -5,9 +5,9 @@ name: CI
 # adding a 20th project does not slow down a PR that only touches the 1st.
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, testing, main]
   push:
-    branches: [develop, main]
+    branches: [develop, testing, main]
 
 permissions:
   contents: read
