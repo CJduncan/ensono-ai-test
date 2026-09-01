@@ -1,0 +1,105 @@
+name: CI
+
+# Runs on every PR into develop/main, and on every push to those branches.
+# Only the projects that actually changed get tested (path-aware matrix), so
+# adding a 20th project does not slow down a PR that only touches the 1st.
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. Work out which projects/<name>/ folders changed in this push/PR.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.changed.outputs.projects }}
+      any: ${{ steps.changed.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need history to diff against the base
+      - id: changed
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # First push to a branch, or a missing/zero base: fall back to root commit.
+          if [ -z "${base:-}" ] || [ "$base" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          fi
+          echo "Diffing ${base}...HEAD"
+          mapfile -t dirs < <(git diff --name-only "$base" HEAD \
+            | awk -F/ '$1=="projects" && $2!="_template" && NF>1 {print $2}' \
+            | sort -u)
+          if [ ${#dirs[@]} -eq 0 ]; then
+            echo "No project folders changed."
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "projects=[]" >> "$GITHUB_OUTPUT"
+          else
+            printf 'Changed projects:\n%s\n' "${dirs[*]}"
+            json=$(printf '%s\n' "${dirs[@]}" | jq -R . | jq -cs .)
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "projects=$json" >> "$GITHUB_OUTPUT"
+          fi
+
+  # 2. Fan out: one runner per changed project, each running that project's ci.sh.
+  test:
+    needs: detect
+    if: needs.detect.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(needs.detect.outputs.projects) }}
+    name: test (${{ matrix.project }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run project CI
+        run: |
+          set -euo pipefail
+          cd "projects/${{ matrix.project }}"
+          chmod +x ci.sh
+          ./ci.sh
+
+  # 3. Repo-wide credential scan. Cheap, always runs, blocks a leak reaching main.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for obvious credentials
+        run: bash .github/scripts/secret-scan.sh
+
+  # 4. One stable check name to require in branch protection. Green only if the
+  #    scan passed and no changed project's tests failed. "test skipped" (nothing
+  #    changed) is a pass; "test failed" is not.
+  ci-status:
+    if: always()
+    needs: [detect, test, secret-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "detect=${{ needs.detect.result }}"
+          echo "test=${{ needs.test.result }}"
+          echo "secret-scan=${{ needs.secret-scan.result }}"
+          if [ "${{ needs.secret-scan.result }}" != "success" ]; then
+            echo "::error::Secret scan did not pass."; exit 1
+          fi
+          if [ "${{ needs.test.result }}" = "failure" ]; then
+            echo "::error::One or more project test suites failed."; exit 1
+          fi
+          echo "CI passed."

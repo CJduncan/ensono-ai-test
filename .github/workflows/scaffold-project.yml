@@ -1,0 +1,66 @@
+name: Scaffold new project
+
+# The "create it for them" step. Run from the Actions tab (Run workflow), give a
+# name and an owner, and it copies projects/_template into a new folder, wires up
+# CODEOWNERS, and opens a PR into develop. No one hand-creates branches.
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: 'Human-readable project name (e.g. "Invoice Parser")'
+        required: true
+      owner:
+        description: "GitHub username who owns this project (no @)"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  scaffold:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Create project from template
+        id: mk
+        run: |
+          set -euo pipefail
+          name="${{ github.event.inputs.project_name }}"
+          owner="${{ github.event.inputs.owner }}"
+          slug=$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+          if [ -z "$slug" ]; then echo "::error::Name produced an empty slug."; exit 1; fi
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          if [ -d "projects/$slug" ]; then
+            echo "::error::projects/$slug already exists — pick another name."; exit 1
+          fi
+          cp -r projects/_template "projects/$slug"
+          sed -i \
+            -e "s/{{PROJECT_NAME}}/${name//\//\\/}/g" \
+            -e "s/{{PROJECT_SLUG}}/$slug/g" \
+            -e "s/{{OWNER}}/$owner/g" \
+            "projects/$slug/README.md"
+          echo "/projects/$slug/ @$owner" >> .github/CODEOWNERS
+
+      - name: Open PR into develop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          slug="${{ steps.mk.outputs.slug }}"
+          name="${{ github.event.inputs.project_name }}"
+          owner="${{ github.event.inputs.owner }}"
+          git config user.name "project-scaffolder[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="scaffold/$slug"
+          git checkout -b "$branch"
+          git add -A
+          git commit -m "Scaffold project: $slug"
+          git push origin "$branch"
+          gh pr create --base develop --head "$branch" \
+            --title "Add project: $name" \
+            --body "Automated scaffold for \`$slug\`, owned by @$owner. Merge into **develop** to land it on the testing branch, then edit the project and let CI run."
