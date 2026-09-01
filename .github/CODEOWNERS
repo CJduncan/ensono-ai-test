@@ -6,3 +6,4 @@
 
 # --- per-project owners (managed by the scaffold workflow) ---
 /projects/hello-service/ @CJduncan
+/projects/benproject3/ @CJduncan
